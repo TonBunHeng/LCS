@@ -1,0 +1,775 @@
+#!/bin/bash
+# ==============================================================================
+# LocalDevServer CLI Management Tool
+# ==============================================================================
+set -e
+
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$BASE_DIR"
+
+# Colors for terminal output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+# Ensure .env exists
+if [ ! -f "$BASE_DIR/.env" ]; then
+    if [ -f "$BASE_DIR/.env.example" ]; then
+        echo -e "${YELLOW}Warning: .env not found. Creating from .env.example...${NC}"
+        cp "$BASE_DIR/.env.example" "$BASE_DIR/.env"
+    else
+        echo -e "${RED}Error: Neither .env nor .env.example found!${NC}"
+        exit 1
+    fi
+fi
+
+# Export environment variables from .env
+set -a
+source "$BASE_DIR/.env"
+set +a
+
+DOMAIN_SUFFIX="${DOMAIN_SUFFIX:-local}"
+DEFAULT_PHP_VERSION="${DEFAULT_PHP_VERSION:-8.3}"
+HTDOCS_DIR="$BASE_DIR/htdocs"
+
+# Helper: Print styled header
+print_header() {
+    echo -e "${BLUE}${BOLD}======================================================${NC}"
+    echo -e "${CYAN}${BOLD}   LocalDevServer - Local Web Development on macOS   ${NC}"
+    echo -e "${BLUE}${BOLD}======================================================${NC}"
+}
+
+# Helper: Get PHP container for project
+get_php_container() {
+    echo "localdev_php"
+}
+
+# ------------------------------------------------------------------------------
+# Commands
+# ------------------------------------------------------------------------------
+
+cmd_start() {
+    print_header
+    local service="$1"
+    if [ -n "$service" ]; then
+        echo -e "${GREEN}Starting service: ${service}...${NC}"
+        docker compose up -d "$service"
+    else
+        echo -e "${GREEN}Starting all LocalDevServer services...${NC}"
+        docker compose up -d
+        echo -e "${GREEN}Services started successfully!${NC}"
+        echo -e "Dashboard: ${BOLD}http://localhost:${APACHE_PORT:-80}${NC}"
+        echo -e "phpMyAdmin: ${BOLD}http://localhost:${PHPMYADMIN_PORT:-8081}${NC}"
+    fi
+    cmd_vhost_sync
+}
+
+cmd_stop() {
+    local service="$1"
+    if [ -n "$service" ]; then
+        echo -e "${YELLOW}Stopping service: ${service}...${NC}"
+        docker compose stop "$service"
+    else
+        echo -e "${YELLOW}Stopping all LocalDevServer services...${NC}"
+        docker compose stop
+        echo -e "${GREEN}All services stopped.${NC}"
+    fi
+}
+
+cmd_restart() {
+    local service="$1"
+    if [ -n "$service" ]; then
+        echo -e "${YELLOW}Restarting service: ${service}...${NC}"
+        docker compose restart "$service"
+    else
+        echo -e "${YELLOW}Restarting all LocalDevServer services...${NC}"
+        docker compose restart
+        cmd_vhost_sync
+    fi
+}
+
+cmd_status() {
+    print_header
+    echo -e "${BOLD}Docker Services Status:${NC}"
+    docker compose ps
+}
+
+cmd_logs() {
+    local service="$1"
+    shift || true
+    if [ -n "$service" ]; then
+        docker compose logs -f "$service" "$@"
+    else
+        docker compose logs -f "$@"
+    fi
+}
+
+cmd_build() {
+    local service="$1"
+    if [ -n "$service" ]; then
+        echo -e "${GREEN}Building image for ${service}...${NC}"
+        docker compose build "$service"
+    else
+        echo -e "${GREEN}Building all custom images...${NC}"
+        docker compose build
+    fi
+}
+
+cmd_update() {
+    print_header
+    echo -e "${GREEN}Pulling latest base images...${NC}"
+    docker compose pull
+    echo -e "${GREEN}Rebuilding custom containers...${NC}"
+    docker compose build
+    echo -e "${GREEN}Update complete.${NC}"
+}
+
+cmd_doctor() {
+    print_header
+    echo -e "${BOLD}Running System Diagnostics & Environment Health Check:${NC}\n"
+
+    # 1. Docker check
+    echo -n "1. Docker Engine: "
+    if docker info >/dev/null 2>&1; then
+        echo -e "${GREEN}[OK] Running${NC}"
+    else
+        echo -e "${RED}[FAIL] Docker daemon is not running! Please start Docker Desktop.${NC}"
+    fi
+
+    # 2. Docker Compose check
+    echo -n "2. Docker Compose: "
+    if docker compose version >/dev/null 2>&1; then
+        echo -e "${GREEN}[OK] Available ($(docker compose version --short))${NC}"
+    else
+        echo -e "${RED}[FAIL] Docker Compose not found.${NC}"
+    fi
+
+    # 3. Environment file check
+    echo -n "3. Configuration (.env): "
+    if [ -f "$BASE_DIR/.env" ]; then
+        echo -e "${GREEN}[OK] Present${NC}"
+    else
+        echo -e "${RED}[FAIL] .env file is missing.${NC}"
+    fi
+
+    # 4. Port conflict checks
+    echo -e "\n4. Checking Port Availability on Host:"
+    ports_to_check=(
+        "Apache:${APACHE_PORT:-80}"
+        "MySQL:${MYSQL_PORT:-3307}"
+        "MariaDB:${MARIADB_PORT:-3308}"
+        "PostgreSQL:${POSTGRES_PORT:-5433}"
+        "phpMyAdmin:${PHPMYADMIN_PORT:-8081}"
+        "Redis:${REDIS_PORT:-6379}"
+    )
+
+    for entry in "${ports_to_check[@]}"; do
+        name="${entry%%:*}"
+        port="${entry##*:}"
+        echo -n "   - $name (Port $port): "
+        # Check if listening outside docker
+        if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+            p_process=$(lsof -nP -iTCP:"$port" -sTCP:LISTEN | tail -n 1 | awk '{print $1}')
+            if [[ "$p_process" =~ com.docke|docker ]]; then
+                echo -e "${GREEN}[OK] In use by LocalDevServer (Docker)${NC}"
+            else
+                echo -e "${YELLOW}[WARNING] In use by host process: $p_process${NC}"
+            fi
+        else
+            echo -e "${GREEN}[OK] Port is free${NC}"
+        fi
+    done
+
+    # 5. Hosts file check
+    echo -e "\n5. macOS Local Domains (/etc/hosts):"
+    if grep -q "### LocalDevServer BEGIN ###" /etc/hosts 2>/dev/null; then
+        entry_count=$(sed -n '/### LocalDevServer BEGIN ###/,/### LocalDevServer END ###/p' /etc/hosts | grep -v '###' | grep -c '127.0.0.1' || true)
+        echo -e "   ${GREEN}[OK] Configured with ${entry_count} local domain entry(ies)${NC}"
+    else
+        echo -e "   ${YELLOW}[INFO] LocalDevServer block not yet added to /etc/hosts.${NC}"
+        echo -e "   Run '${BOLD}./localdev hosts:sync${NC}' to synchronize all domains."
+    fi
+
+    echo -e "\n${GREEN}${BOLD}Diagnostics completed.${NC}\n"
+}
+
+cmd_vhost_sync() {
+    if docker ps --format '{{.Names}}' | grep -q "localdev_apache"; then
+        echo -e "${CYAN}Syncing Apache VirtualHosts...${NC}"
+        docker exec localdev_apache /scripts/generate-vhosts.sh
+        docker exec localdev_apache httpd -k graceful 2>/dev/null || true
+        echo -e "${GREEN}Apache VirtualHosts synced and reloaded.${NC}"
+    fi
+}
+
+cmd_hosts_sync() {
+    print_header
+    echo -e "${CYAN}Synchronizing local domains with /etc/hosts...${NC}"
+
+    local domains=("localhost")
+    if [ -d "$HTDOCS_DIR" ]; then
+        for p in "$HTDOCS_DIR"/*; do
+            if [ -d "$p" ]; then
+                local bname=$(basename "$p")
+                if [[ ! "$bname" =~ ^\. ]]; then
+                    domains+=("${bname}.${DOMAIN_SUFFIX}")
+                fi
+            fi
+        done
+    fi
+
+    echo -e "Detected ${#domains[@]} domain(s):"
+    for d in "${domains[@]}"; do
+        echo -e "  - ${BOLD}http://$d${NC}"
+    done
+
+    # Generate hosts block
+    local tmp_file=$(mktemp)
+    echo "### LocalDevServer BEGIN ###" > "$tmp_file"
+    for d in "${domains[@]}"; do
+        if [ "$d" != "localhost" ]; then
+            echo "127.0.0.1 $d www.$d" >> "$tmp_file"
+        fi
+    done
+    echo "### LocalDevServer END ###" >> "$tmp_file"
+
+    # Check if sudo is needed
+    echo -e "\n${YELLOW}Updating /etc/hosts (requires macOS administrator/sudo permissions)...${NC}"
+    
+    # Remove existing block if present, then append new block
+    if sudo /bin/sh -c "
+        if grep -q '### LocalDevServer BEGIN ###' /etc/hosts; then
+            sed -i '' '/### LocalDevServer BEGIN ###/,/### LocalDevServer END ###/d' /etc/hosts
+        fi
+        cat '$tmp_file' >> /etc/hosts
+    "; then
+        rm -f "$tmp_file"
+        echo -e "${GREEN}Successfully updated /etc/hosts!${NC}"
+        # Flush macOS DNS cache
+        echo -e "${CYAN}Flushing macOS DNS cache...${NC}"
+        sudo dscacheutil -flushcache 2>/dev/null || true
+        sudo killall -HUP mDNSResponder 2>/dev/null || true
+        echo -e "${GREEN}DNS cache flushed.${NC}"
+    else
+        rm -f "$tmp_file"
+        echo -e "${RED}Failed to update /etc/hosts.${NC}"
+        exit 1
+    fi
+}
+
+cmd_create() {
+    local type="$1"
+    local name="$2"
+    local version="$3"
+
+    if [ -z "$type" ] || [ -z "$name" ]; then
+        echo -e "${RED}Usage: ./localdev create <php|laravel> <project-name> [php-version]${NC}"
+        exit 1
+    fi
+
+    # Sanitize project name
+    if [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        echo -e "${RED}Error: Project name can only contain letters, numbers, dashes, and underscores.${NC}"
+        exit 1
+    fi
+
+    local project_path="$HTDOCS_DIR/$name"
+    if [ -d "$project_path" ]; then
+        echo -e "${RED}Error: Directory 'htdocs/$name' already exists!${NC}"
+        exit 1
+    fi
+
+    print_header
+    echo -e "${GREEN}Creating new ${type} project: ${BOLD}${name}${NC}..."
+
+    mkdir -p "$project_path"
+
+    # Set PHP version if specified
+    if [ -n "$version" ]; then
+        echo "$version" > "$project_path/.php-version"
+        echo -e "PHP Version set to: ${BOLD}$version${NC}"
+    fi
+
+    if [ "$type" == "php" ]; then
+        # Create standard PHP template
+        cat <<'EOF' > "$project_path/index.php"
+<?php
+$title = "Welcome to LocalDevServer";
+$projectName = basename(__DIR__);
+
+// Test DB connections
+function testConnection($dsn, $user, $pass) {
+    try {
+        $pdo = new PDO($dsn, $user, $pass, [PDO::ATTR_TIMEOUT => 1]);
+        return ['status' => true, 'message' => 'Connected successfully'];
+    } catch (Exception $e) {
+        return ['status' => false, 'message' => $e->getMessage()];
+    }
+}
+
+$mysqlTest = testConnection('mysql:host=mysql;port=3306;dbname=localdev_mysql', 'devuser', 'devpass');
+$mariadbTest = testConnection('mysql:host=mariadb;port=3306;dbname=localdev_mariadb', 'devuser', 'devpass');
+$postgresTest = testConnection('pgsql:host=postgresql;port=5432;dbname=localdev_postgres', 'devuser', 'devpass');
+
+$redisStatus = ['status' => false, 'message' => 'Redis extension not loaded'];
+if (class_exists('Redis')) {
+    try {
+        $redis = new Redis();
+        $redis->connect('redis', 6379, 1);
+        $redisStatus = ['status' => true, 'message' => 'Connected successfully (Ping: ' . $redis->ping() . ')'];
+    } catch (Exception $e) {
+        $redisStatus = ['status' => false, 'message' => $e->getMessage()];
+    }
+}
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title><?= htmlspecialchars($projectName) ?> - LocalDevServer</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        body { background: #ffffff; color: #000000; padding: 3rem 1.5rem; line-height: 1.5; }
+        .card { max-width: 760px; margin: 0 auto; background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 2.25rem; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+        h1 { font-size: 1.5rem; font-weight: 700; letter-spacing: -0.02em; margin-bottom: 0.35rem; }
+        p.sub { color: #52525b; font-size: 0.9rem; }
+        .badge { display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.2rem 0.55rem; border-radius: 4px; font-size: 0.72rem; font-weight: 600; text-transform: uppercase; border: 1px solid #e2e8f0; }
+        .ok { background: #f8fafc; color: #000000; }
+        .fail { background: #fef2f2; color: #dc2626; border-color: #fecaca; }
+        .dot { width: 6px; height: 6px; border-radius: 50%; background: #10b981; }
+        .fail .dot { background: #ef4444; }
+        table { width: 100%; border-collapse: collapse; margin-top: 1.75rem; text-align: left; }
+        th { background: #f8fafc; padding: 0.75rem 1rem; border-bottom: 1px solid #e2e8f0; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: #52525b; }
+        td { padding: 0.85rem 1rem; border-bottom: 1px solid #e2e8f0; font-size: 0.88rem; }
+        tr:last-child td { border-bottom: none; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>Project: <?= htmlspecialchars($projectName) ?></h1>
+        <p class="sub">Running on PHP <strong><?= PHP_VERSION ?></strong> via Apache &amp; Docker</p>
+        
+        <h2 style="margin-top: 2rem; font-size: 1.05rem; font-weight: 700;">Database Connectivity:</h2>
+        <table>
+            <tr><th>Service</th><th>Status</th><th>Details</th></tr>
+            <tr>
+                <td><strong>MySQL 8.x</strong></td>
+                <td><span class="badge <?= $mysqlTest['status'] ? 'ok' : 'fail' ?>"><span class="dot"></span><?= $mysqlTest['status'] ? 'ONLINE' : 'OFFLINE' ?></span></td>
+                <td style="color: #52525b; font-size: 0.82rem;"><?= htmlspecialchars($mysqlTest['message']) ?></td>
+            </tr>
+            <tr>
+                <td><strong>MariaDB 11.x</strong></td>
+                <td><span class="badge <?= $mariadbTest['status'] ? 'ok' : 'fail' ?>"><span class="dot"></span><?= $mariadbTest['status'] ? 'ONLINE' : 'OFFLINE' ?></span></td>
+                <td style="color: #52525b; font-size: 0.82rem;"><?= htmlspecialchars($mariadbTest['message']) ?></td>
+            </tr>
+            <tr>
+                <td><strong>PostgreSQL 16+</strong></td>
+                <td><span class="badge <?= $postgresTest['status'] ? 'ok' : 'fail' ?>"><span class="dot"></span><?= $postgresTest['status'] ? 'ONLINE' : 'OFFLINE' ?></span></td>
+                <td style="color: #52525b; font-size: 0.82rem;"><?= htmlspecialchars($postgresTest['message']) ?></td>
+            </tr>
+            <tr>
+                <td><strong>Redis</strong></td>
+                <td><span class="badge <?= $redisStatus['status'] ? 'ok' : 'fail' ?>"><span class="dot"></span><?= $redisStatus['status'] ? 'ONLINE' : 'OFFLINE' ?></span></td>
+                <td style="color: #52525b; font-size: 0.82rem;"><?= htmlspecialchars($redisStatus['message']) ?></td>
+            </tr>
+        </table>
+    </div>
+</body>
+</html>
+EOF
+
+        # Sample .htaccess for routing support
+        cat <<'EOF' > "$project_path/.htaccess"
+RewriteEngine On
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^ index.php [L]
+EOF
+
+    elif [ "$type" == "laravel" ]; then
+        # Create standard Laravel directory structure
+        mkdir -p "$project_path/app/Http/Controllers" \
+                 "$project_path/bootstrap/cache" \
+                 "$project_path/config" \
+                 "$project_path/public" \
+                 "$project_path/resources/views" \
+                 "$project_path/routes" \
+                 "$project_path/storage/app/public" \
+                 "$project_path/storage/framework/cache" \
+                 "$project_path/storage/framework/sessions" \
+                 "$project_path/storage/framework/views" \
+                 "$project_path/storage/logs"
+
+        # Create public/index.php
+        cat <<'EOF' > "$project_path/public/index.php"
+<?php
+define('LARAVEL_START', microtime(true));
+
+$projectName = basename(dirname(__DIR__));
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title><?= htmlspecialchars($projectName) ?> - Laravel App</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        body { background: #ffffff; color: #000000; padding: 3rem 1.5rem; line-height: 1.5; }
+        .card { max-width: 760px; margin: 0 auto; background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 2.25rem; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+        h1 { font-size: 1.5rem; font-weight: 700; letter-spacing: -0.02em; margin-bottom: 0.35rem; display: flex; align-items: center; gap: 0.5rem; }
+        .tag { background: #000000; color: #ffffff; padding: 0.2rem 0.55rem; border-radius: 4px; font-size: 0.72rem; font-weight: 600; text-transform: uppercase; }
+        p.sub { color: #52525b; font-size: 0.9rem; margin-top: 0.5rem; }
+        .code { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 1rem; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 0.82rem; color: #000000; margin-top: 1.25rem; line-height: 1.7; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>
+            <span>&#9632;</span> <?= htmlspecialchars($projectName) ?>
+            <span class="tag">Laravel Ready</span>
+        </h1>
+        <p class="sub">
+            DocumentRoot is locked strictly to <code>public/</code>. Root <code>.env</code> and application files are protected.
+        </p>
+        <p style="margin-top: 0.75rem; font-size: 0.9rem;">
+            Running on PHP <strong><?= PHP_VERSION ?></strong> via Apache &amp; Docker.
+        </p>
+
+        <h3 style="margin-top: 1.5rem; font-size: 0.95rem; font-weight: 700;">Artisan &amp; CLI Commands:</h3>
+        <div class="code">
+            # Run commands inside container:<br>
+            ./localdev artisan <?= htmlspecialchars($projectName) ?> migrate<br>
+            ./localdev artisan <?= htmlspecialchars($projectName) ?> make:controller PostController<br>
+            ./localdev composer <?= htmlspecialchars($projectName) ?> require &lt;package&gt;<br>
+            ./localdev npm <?= htmlspecialchars($projectName) ?> run build
+        </div>
+    </div>
+</body>
+</html>
+EOF
+
+        # Create public/.htaccess with standard Laravel front-controller rewrite rules
+        cat <<'EOF' > "$project_path/public/.htaccess"
+<IfModule mod_rewrite.c>
+    <IfModule mod_negotiation.c>
+        Options -MultiViews -Indexes
+    </IfModule>
+
+    RewriteEngine On
+
+    # Handle Authorization Header
+    RewriteCond %{HTTP:Authorization} .
+    RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+
+    # Redirect Trailing Slashes If Not A Folder...
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteCond %{REQUEST_URI} (.+)/$
+    RewriteRule ^ %1 [L,R=301]
+
+    # Send Requests To Front Controller...
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteRule ^ index.php [L]
+</IfModule>
+EOF
+
+        # Create mock artisan CLI executable
+        cat <<'EOF' > "$project_path/artisan"
+#!/usr/bin/env php
+<?php
+define('LARAVEL_START', microtime(true));
+
+$args = array_slice($argv, 1);
+$cmd = implode(' ', $args);
+
+echo "LocalDevServer Artisan Runner (Mock / Scaffolding)\n";
+echo "Command executed: php artisan $cmd\n";
+echo "To initialize full Laravel framework code, run: ./localdev composer " . basename(__DIR__) . " install\n";
+EOF
+        chmod +x "$project_path/artisan"
+
+        # Create .env for Laravel
+        cat <<EOF > "$project_path/.env"
+APP_NAME="${name}"
+APP_ENV=local
+APP_KEY=
+APP_DEBUG=true
+APP_URL=http://${name}.${DOMAIN_SUFFIX}
+
+LOG_CHANNEL=stack
+LOG_LEVEL=debug
+
+DB_CONNECTION=mysql
+DB_HOST=mysql
+DB_PORT=3306
+DB_DATABASE=localdev_mysql
+DB_USERNAME=devuser
+DB_PASSWORD=devpass
+
+BROADCAST_DRIVER=log
+CACHE_DRIVER=redis
+FILESYSTEM_DISK=local
+QUEUE_CONNECTION=redis
+SESSION_DRIVER=redis
+SESSION_LIFETIME=120
+
+REDIS_HOST=redis
+REDIS_PASSWORD=null
+REDIS_PORT=6379
+EOF
+
+        # Storage permissions
+        chmod -R 777 "$project_path/storage" "$project_path/bootstrap/cache"
+    fi
+
+    cmd_vhost_sync
+
+    local domain="${name}.${DOMAIN_SUFFIX}"
+    echo -e "\n${GREEN}${BOLD}Project '${name}' created successfully!${NC}"
+    echo -e "Access URL: ${CYAN}${BOLD}http://${domain}${NC}"
+    echo -e "DocumentRoot: ${BOLD}htdocs/${name}/$([ "$type" == "laravel" ] && echo "public" || echo "")${NC}"
+
+    # Prompt or auto sync hosts
+    echo -e "\n${YELLOW}To access http://${domain} directly in your browser, sync your hosts file:${NC}"
+    echo -e "Run: ${BOLD}./localdev hosts:sync${NC}"
+}
+
+cmd_list() {
+    print_header
+    echo -e "${BOLD}Detected Projects in htdocs/:${NC}\n"
+
+    printf "%-22s %-26s %-16s %-10s %-12s\n" "PROJECT" "LOCAL DOMAIN" "TYPE" "PHP" "DOCUMENT ROOT"
+    echo "----------------------------------------------------------------------------------------"
+
+    if [ -d "$HTDOCS_DIR" ]; then
+        local count=0
+        for p in "$HTDOCS_DIR"/*; do
+            if [ -d "$p" ]; then
+                local bname=$(basename "$p")
+                if [[ ! "$bname" =~ ^\. ]]; then
+                    count=$((count+1))
+                    local is_laravel="No"
+                    local type_label="Standard PHP"
+                    local docroot="./"
+                    if [ -d "$p/public" ] || [ -f "$p/artisan" ]; then
+                        type_label="Laravel"
+                        docroot="public/"
+                    fi
+
+                    local php_ver="8.5 (Latest)"
+                    local domain="${bname}.${DOMAIN_SUFFIX}"
+                    printf "%-22s %-26s %-16s %-10s %-12s\n" "$bname" "http://$domain" "$type_label" "PHP $php_ver" "$docroot"
+                fi
+            fi
+        done
+        if [ $count -eq 0 ]; then
+            echo "No projects found in htdocs/. Create one using './localdev create php <name>'"
+        fi
+    fi
+    echo ""
+}
+
+cmd_remove() {
+    local name="$1"
+    if [ -z "$name" ]; then
+        echo -e "${RED}Usage: ./localdev remove <project-name>${NC}"
+        exit 1
+    fi
+
+    local project_path="$HTDOCS_DIR/$name"
+    if [ ! -d "$project_path" ]; then
+        echo -e "${RED}Error: Project '$name' does not exist in htdocs/${NC}"
+        exit 1
+    fi
+
+    echo -e "${RED}${BOLD}WARNING: This will permanently delete 'htdocs/$name' and its contents!${NC}"
+    read -p "Are you sure you want to proceed? [y/N]: " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        rm -rf "$project_path"
+        echo -e "${GREEN}Project '$name' removed.${NC}"
+        cmd_vhost_sync
+        echo -e "${YELLOW}Syncing hosts file to remove domain...${NC}"
+        cmd_hosts_sync
+    else
+        echo -e "${YELLOW}Aborted.${NC}"
+    fi
+}
+
+cmd_switch_php() {
+    echo -e "${CYAN}LocalDevServer uses the unified PHP 8.5+ (Latest) environment for all projects.${NC}"
+}
+
+cmd_artisan() {
+    local project="$1"
+    shift || true
+
+    if [ -z "$project" ]; then
+        echo -e "${RED}Usage: ./localdev artisan <project-name> <artisan-command>${NC}"
+        exit 1
+    fi
+
+    local container=$(get_php_container "$project")
+    echo -e "${CYAN}Running php artisan in container '${container}' for '${project}'...${NC}"
+    docker exec -it -w "/var/www/html/$project" "$container" php artisan "$@"
+}
+
+cmd_composer() {
+    local project="$1"
+    shift || true
+
+    if [ -z "$project" ]; then
+        echo -e "${RED}Usage: ./localdev composer <project-name> <composer-command>${NC}"
+        exit 1
+    fi
+
+    local container=$(get_php_container "$project")
+    echo -e "${CYAN}Running composer in container '${container}' for '${project}'...${NC}"
+    docker exec -it -w "/var/www/html/$project" "$container" composer "$@"
+}
+
+cmd_npm() {
+    local project="$1"
+    shift || true
+
+    if [ -z "$project" ]; then
+        echo -e "${RED}Usage: ./localdev npm <project-name> <npm-command>${NC}"
+        exit 1
+    fi
+
+    echo -e "${CYAN}Running npm in node container for '${project}'...${NC}"
+    docker exec -it -w "/var/www/html/$project" localdev_node npm "$@"
+}
+
+cmd_shell() {
+    local service="${1:-php83}"
+    local container="localdev_${service}"
+    if ! docker ps --format '{{.Names}}' | grep -q "^${container}$"; then
+        container="$service"
+    fi
+    echo -e "${CYAN}Opening interactive shell in ${container}...${NC}"
+    docker exec -it "$container" /bin/sh 2>/dev/null || docker exec -it "$container" /bin/bash
+}
+
+cmd_backup() {
+    bash "$BASE_DIR/scripts/backup.sh" "$@"
+}
+
+cmd_restore() {
+    bash "$BASE_DIR/scripts/restore.sh" "$@"
+}
+
+cmd_help() {
+    print_header
+    echo -e "${BOLD}Available Commands:${NC}"
+    echo -e "  ${GREEN}./localdev start [service]${NC}          Start all or a specific service"
+    echo -e "  ${GREEN}./localdev stop [service]${NC}           Stop all or a specific service"
+    echo -e "  ${GREEN}./localdev restart [service]${NC}        Restart all or a specific service"
+    echo -e "  ${GREEN}./localdev status${NC}                   Show service status and ports"
+    echo -e "  ${GREEN}./localdev logs [service]${NC}           View container logs in real time"
+    echo -e "  ${GREEN}./localdev build [service]${NC}          Rebuild docker container images"
+    echo -e "  ${GREEN}./localdev update${NC}                   Pull latest images and rebuild"
+    echo -e "  ${GREEN}./localdev doctor${NC}                   Run environment diagnostics & port audit"
+    echo ""
+    echo -e "  ${GREEN}./localdev create php <name> [ver]${NC}  Create new standard PHP project (8.2/8.3/8.4)"
+    echo -e "  ${GREEN}./localdev create laravel <name> [ver]${NC} Create new Laravel project"
+    echo -e "  ${GREEN}./localdev list${NC}                     List all projects in htdocs/"
+    echo -e "  ${GREEN}./localdev remove <name>${NC}            Safely remove a project and its domain"
+    echo -e "  ${GREEN}./localdev php:switch <prj> <ver>${NC}  Switch a project's PHP version"
+    echo ""
+    echo -e "  ${GREEN}./localdev hosts:sync${NC}               Sync all project domains with /etc/hosts"
+    echo -e "  ${GREEN}./localdev vhost:sync${NC}               Regenerate and reload Apache VirtualHosts"
+    echo ""
+    echo -e "  ${GREEN}./localdev artisan <prj> <cmd>${NC}     Execute artisan commands inside container"
+    echo -e "  ${GREEN}./localdev composer <prj> <cmd>${NC}    Execute composer commands inside container"
+    echo -e "  ${GREEN}./localdev npm <prj> <cmd>${NC}         Execute npm commands inside node container"
+    echo -e "  ${GREEN}./localdev shell [service]${NC}         Open interactive shell in container"
+    echo ""
+    echo -e "  ${GREEN}./localdev backup [mysql|mariadb|postgres|all]${NC} Backup databases to backups/"
+    echo -e "  ${GREEN}./localdev restore <file> [type]${NC}  Restore a database dump"
+    echo ""
+}
+
+# ------------------------------------------------------------------------------
+# Dispatcher
+# ------------------------------------------------------------------------------
+action="$1"
+shift || true
+
+case "$action" in
+    start)
+        cmd_start "$@"
+        ;;
+    stop)
+        cmd_stop "$@"
+        ;;
+    restart)
+        cmd_restart "$@"
+        ;;
+    status)
+        cmd_status
+        ;;
+    logs)
+        cmd_logs "$@"
+        ;;
+    build)
+        cmd_build "$@"
+        ;;
+    update)
+        cmd_update
+        ;;
+    doctor)
+        cmd_doctor
+        ;;
+    create)
+        cmd_create "$@"
+        ;;
+    list)
+        cmd_list
+        ;;
+    remove)
+        cmd_remove "$@"
+        ;;
+    php:switch)
+        cmd_switch_php "$@"
+        ;;
+    hosts:sync|sync-hosts)
+        cmd_hosts_sync
+        ;;
+    vhost:sync|sync-vhosts)
+        cmd_vhost_sync
+        ;;
+    artisan)
+        cmd_artisan "$@"
+        ;;
+    composer)
+        cmd_composer "$@"
+        ;;
+    npm)
+        cmd_npm "$@"
+        ;;
+    shell)
+        cmd_shell "$@"
+        ;;
+    backup)
+        cmd_backup "$@"
+        ;;
+    restore)
+        cmd_restore "$@"
+        ;;
+    help|--help|-h|"")
+        cmd_help
+        ;;
+    *)
+        echo -e "${RED}Unknown command: $action${NC}"
+        cmd_help
+        exit 1
+        ;;
+esac
+

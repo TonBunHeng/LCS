@@ -1,0 +1,37 @@
+# LocalDevServer .gitignore
+
+# Environment files
+.env
+!.env.example
+
+# Database data persistence (keep folders, ignore binary data)
+databases/mysql/*
+!databases/mysql/.gitkeep
+databases/mariadb/*
+!databases/mariadb/.gitkeep
+databases/postgresql/*
+!databases/postgresql/.gitkeep
+databases/redis/*
+!databases/redis/.gitkeep
+
+# Backups
+backups/*
+!backups/.gitkeep
+!backups/README.md
+
+# Log files
+logs/*/*
+!logs/*/.gitkeep
+
+# Auto-generated virtual host configs
+docker/apache/vhosts/auto-*.conf
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
